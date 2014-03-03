@@ -1,4 +1,4 @@
-%% @author Marc Worrell + Fred Pook <marc@worrell.nl>
+%% @author Marc Worrell <marc@worrell.nl>
 %% @copyright 2011-2013 Marc Worrell
 %% @doc Import data from an Anymeta website
 
@@ -37,9 +37,9 @@
     event/2,
     
     find_any_id/2,
-    do_import/7,
-    get_thing/5,
-    test_host/5
+    do_import/6,
+    get_thing/4,
+    test_host/4
 ]).
 
 -include_lib("zotonic.hrl").
@@ -183,9 +183,7 @@ event(#submit{message=import_anymeta, form=Form}, Context) ->
         false ->
             z_render:growl_error(?__("Sorry, you are not allowed to use the Anymeta import module.", Context), Context);
         true ->
-            %% Password = z_string:trim(z_context:get_q("sysadmin-pw", Context)),
-			Password = [],
-            Username = case Password of [] -> []; _ -> "sysadmin" end,
+            Secret   = z_string:trim(z_context:get_q("sysadmin-pw", Context)),
             From     = z_convert:to_integer(z_context:get_q_validated("start-id", Context)),
             To       = z_convert:to_integer(z_context:get_q_validated("end-id", Context)),
             Host     = z_string:trim(z_context:get_q("host", Context)),
@@ -195,7 +193,7 @@ event(#submit{message=import_anymeta, form=Form}, Context) ->
 
             z_context:set_session(anymeta_host, Host, Context),
             
-            case do_import(Host, From, To, Username, Password, KeepId, Context) of
+            case do_import(Host, From, To, Secret, KeepId, Context) of
                 ok ->
                     z_render:wire([{fade_in, [{target, "import-started"}]}, {hide, [{target, Form}]}], Context);
                 {error, nxdomain} ->
@@ -234,27 +232,27 @@ find_any_id(AnyId, Context) when is_integer(AnyId)->
     end.
 
 
-do_import(Host, undefined, To, Username, Password, KeepId, Context) ->
-    do_import(Host, 1, To, Username, Password, KeepId, Context);
-do_import(Host, From, To, Username, Password, KeepId, Context) ->
-    case test_host(From, Host, Username, Password, Context) of
+do_import(Host, undefined, To, Secret, KeepId, Context) ->
+    do_import(Host, 1, To, Secret, KeepId, Context);
+do_import(Host, From, To, Secret, KeepId, Context) ->
+    case test_host(From, Host, Secret, Context) of
         ok ->
-            start_import(Host, From, To, Username, Password, KeepId, Context);
+            start_import(Host, From, To, Secret, KeepId, Context);
         Err ->
             Err
     end.
 
-    start_import(Host, From, To, Username, Password, KeepId, Context) ->
+    start_import(Host, From, To, Secret, KeepId, Context) ->
         ContextPruned = z_context:prune_for_async(Context),
         spawn(fun() ->
-                    import_loop(Host, From, To, Username, Password, KeepId, #stats{}, ContextPruned)
+                    import_loop(Host, From, To, Secret, KeepId, #stats{}, ContextPruned)
               end),
         ok.
     
-    test_host(From, Host, Username, Password, Context) ->
-        Url = get_url(From, Host),
+    test_host(From, Host, Secret, Context) ->
+        Url = get_url(From, Host, Secret),
         progress(io_lib:format("TEST HOST: pinging ~p ...", [Url]), Context),
-        case get_request(get, Url, Username, Password) of
+        case get_request(get, Url) of
             {ok, {{_, 200, _},Hs, _}} ->
                 progress("TEST HOST: 200 OK", Context),
                 case proplists:get_value("content-type", Hs) of
@@ -290,12 +288,12 @@ do_import(Host, From, To, Username, Password, KeepId, Context) ->
         end.
 
 
-get_url(Id, Host) ->
-    "http://"++Host++"/thing/"++integer_to_list(Id)++"/json?secret=run".
+get_url(Id, Host, Secret) ->
+    "http://"++Host++"/thing/"++integer_to_list(Id)++"/json?secret="++Secret.
 
-get_thing(Id, Hostname, User, Pass, Context) ->
-    Url = get_url(Id, Hostname),
-    case get_request(get, Url, User, Pass) of
+get_thing(Id, Hostname, Secret, Context) ->
+    Url = get_url(Id, Hostname, Secret),
+    case get_request(get, Url) of
         {ok, {
             {_HTTP, 200, _OK},
             Headers,
@@ -320,6 +318,8 @@ get_thing(Id, Hostname, User, Pass, Context) ->
             Err;
         {ok, {{_, 503, _}, _, _}} ->
             {error, no_service};
+        {ok, {{_, 410, _}, _, _}} ->
+            {error, gone};
         {ok, {{_, 404, _}, _, _}} ->
             {error, not_found};
         {ok, {{_, 401, _}, _, _}} ->
@@ -329,31 +329,23 @@ get_thing(Id, Hostname, User, Pass, Context) ->
             {error, unexpected_result}
     end.
 
-get_request(Method, Url, User, Pass) ->
-    Headers = auth_header(User, Pass),
+get_request(Method, Url) ->
+    Headers = [],
     httpc:request(Method, {Url, Headers}, [{autoredirect, true}, {relaxed, true}, {timeout, 60000}], []).
-
-    auth_header(undefined, undefined) ->
-        [];
-    auth_header([], []) ->
-        [];
-    auth_header(User, Pass) ->
-        Encoded = base64:encode_to_string(lists:append([User,":",Pass])),
-        [{"Authorization","Basic " ++ Encoded}].
 
 
 %% @doc Fetch all items from the given host
-import_loop(Host, _From, undefined, Username, Password, KeepId, #stats{consequetive_notfound=NF, delayed=Delayed} = Stats, Context) when NF > 100 ->
+import_loop(Host, _From, undefined, Secret, KeepId, #stats{consequetive_notfound=NF, delayed=Delayed} = Stats, Context) when NF > 100 ->
     % Signal the end of the import to the UI
     progress("STOP - found more than 100 consequetive not founds.<br/>", Context),
-    handle_delayed(Delayed, Host, Username, Password, KeepId, Stats#stats{delayed=[]}, Context);
-import_loop(Host, From, To, Username, Password, KeepId, Stats, Context) when is_integer(To), From > To ->
+    handle_delayed(Delayed, Host, Secret, KeepId, Stats#stats{delayed=[]}, Context);
+import_loop(Host, From, To, Secret, KeepId, Stats, Context) when is_integer(To), From > To ->
     % Signal the end of the import to the UI
     progress(io_lib:format("STOP - At last import anymeta id (~w).<br/>", [To]), Context),
-    handle_delayed(Stats#stats.delayed, Host, Username, Password, KeepId, Stats#stats{delayed=[]}, Context);
-import_loop(Host, From, To, Username, Password, KeepId, Stats, Context) ->
+    handle_delayed(Stats#stats.delayed, Host, Secret, KeepId, Stats#stats{delayed=[]}, Context);
+import_loop(Host, From, To, Secret, KeepId, Stats, Context) ->
     progress(io_lib:format("~w: fetching from ~p", [From, Host]), Context),
-    case get_thing(From, Host, Username, Password, Context) of
+    case get_thing(From, Host, Secret, Context) of
         {ok, Thing} ->
             progress(io_lib:format("~w: importing", [From]), Context),
             Stats1 = import_thing(Host, From, Thing, KeepId, Stats, Context),
@@ -361,17 +353,17 @@ import_loop(Host, From, To, Username, Password, KeepId, Stats, Context) ->
                 found=Stats#stats.found+1, 
                 consequetive_notfound=0
             },
-            import_loop(Host, From+1, To, Username, Password, KeepId, Stats2, Context);
+            import_loop(Host, From+1, To, Secret, KeepId, Stats2, Context);
         {error, no_service} ->
             progress(io_lib:format("~w: got 503 - waiting 10 seconds before retry.", [From]), Context),
             % Anymeta servers give a 503 when they are overloaded.
             % Sleep for 10 seconds and then retry our request.
             timer:sleep(10000),
-            import_loop(Host, From, To, Username, Password, KeepId, Stats, Context);
+            import_loop(Host, From, To, Secret, KeepId, Stats, Context);
         {error, timeout} ->
             progress(io_lib:format("~w: got timeout - waiting 5 seconds before retry.", [From]), Context),
             timer:sleep(5000),
-            import_loop(Host, From, To, Username, Password, KeepId, Stats, Context);
+            import_loop(Host, From, To, Secret, KeepId, Stats, Context);
         {error, not_found} ->
             progress(io_lib:format("~w: not found, skipping to next", [From]), Context),
             Stats1 = Stats#stats{
@@ -379,40 +371,38 @@ import_loop(Host, From, To, Username, Password, KeepId, Stats, Context) ->
                 consequetive_notfound=Stats#stats.consequetive_notfound+1,
                 error=[{From, notfound} | Stats#stats.error]
             },
-            import_loop(Host, From+1, To, Username, Password, KeepId, Stats1, Context);
-        {error, unauthorized} ->
-            progress(io_lib:format("~w: unauthorized, skipping to next", [From]), Context),
-            import_loop(Host, From, To, Username, Password, KeepId, Stats, Context);
+            import_loop(Host, From+1, To, Secret, KeepId, Stats1, Context);
         {error, Reason} ->
             progress(io_lib:format("~w: error, skipping to next (error: ~p)", [From, Reason]), Context),
             Stats1 = Stats#stats{
                 error=[{From, Reason} | Stats#stats.error]
             },
-            import_loop(Host, From+1, To, Username, Password, KeepId, Stats1, Context)
+            import_loop(Host, From+1, To, Secret, KeepId, Stats1, Context)
     end.
 
 
-    handle_delayed([], _Host, _Username, _Password, _KeepId, #stats{delayed=[]} = Stats, _Context) ->
+    handle_delayed([], _Host, _Secret, _KeepId, #stats{delayed=[]} = Stats, _Context) ->
         {ok, Stats};
-    handle_delayed([], Host, Username, Password, KeepId, #stats{delayed=Delayed} = Stats, Context) ->
-        handle_delayed(Delayed, Host, Username, Password, KeepId, Stats#stats{delayed=[]}, Context);
-    handle_delayed([{keyword, RscId, AnymetaId}|Ds], Host, Username, Password, KeepId, Stats, Context) ->
-        FoundId = case find_any_id(AnymetaId, Context) of
+    handle_delayed([], Host, Secret, KeepId, #stats{delayed=Delayed} = Stats, Context) ->
+        handle_delayed(Delayed, Host, Secret, KeepId, Stats#stats{delayed=[]}, Context);
+    handle_delayed([{keyword, RscId, AnymetaId}|Ds], Host, Secret, KeepId, Stats, Context) ->
+        AnyId = z_convert:to_integer(AnymetaId),
+        FoundId = case find_any_id(AnyId, Context) of
                     undefined ->
-                        {ok, Stats1} = import_loop(Host, AnymetaId, AnymetaId, Username, Password, KeepId, Stats, Context),
-                        find_any_id(AnymetaId, Context);
-                    {ok, FndId} ->
+                        {ok, Stats1} = import_loop(Host, AnyId, AnyId, Secret, KeepId, Stats, Context),
+                        find_any_id(AnyId, Context);
+                    FndId ->
                         Stats1 = Stats,
                         FndId
                   end,
         case FoundId of
             {ok, KwId} ->
-                progress(io_lib:format("    Edge ~w -[~p]-> ~w", [RscId,'keyword',KwId]), Context),
-                {ok, _} = m_edge:insert(RscId, 'subject', KwId, [no_touch], Context);
+                progress(io_lib:format("    Edge ~w -[~p]-> ~w", [RscId,subject,KwId]), Context),
+                {ok, _} = m_edge:insert(RscId, subject, KwId, [no_touch], Context);
             undefined ->
-                progress(io_lib:format("~w: not imported, skipping as keyword of ~w", [AnymetaId, RscId]), Context)
+                progress(io_lib:format("~w: not imported, skipping as keyword of ~w", [AnyId, RscId]), Context)
         end,
-        handle_delayed(Ds, Host, Username, Password, KeepId, Stats1, Context).
+        handle_delayed(Ds, Host, Secret, KeepId, Stats1, Context).
 
 
 import_thing(Host, AnymetaId, Thing, KeepId, Stats, Context) ->
@@ -420,7 +410,6 @@ import_thing(Host, AnymetaId, Thing, KeepId, Stats, Context) ->
     case skip(Thing) of
         false ->
             {struct, Texts} = proplists:get_value(<<"lang">>, Thing),
-            Uuid = proplists:get_value(<<"resource_uri">>, Thing),
             Texts1 = [ map_texts(map_language(Lang), T) || {Lang, {struct, T}} <- Texts ],
             Texts2 = group_by_lang(Texts1),
             Websites = proplists:get_value(website, Texts2),
@@ -431,7 +420,7 @@ import_thing(Host, AnymetaId, Thing, KeepId, Stats, Context) ->
             Fields0 = [
                         fix_media_category(convert_category(Thing, Context), Thing),
                         {anymeta_id, AnymetaId},
-                        {anymeta_uuid, Uuid},
+                        {anymeta_uuid, proplists:get_value(<<"resource_uri">>, Thing)},
                         {anymeta_host, Host},
                         {language, Langs}
                         |OtherFields
@@ -456,36 +445,26 @@ import_thing(Host, AnymetaId, Thing, KeepId, Stats, Context) ->
             Fields3 = fix_rsc_name(Fields2),
             FieldsFinal = z_notifier:foldl(import_anymeta_fields, Fields3, Context),
             
-            case write_rsc(AnymetaId, Uuid, FieldsFinal, KeepId, Stats, Context) of
+            case write_rsc(AnymetaId, FieldsFinal, KeepId, Stats, Context) of
                 {ok, RscId, Stats1} ->
-					% TO DO: check if types are handled as keywords
-					%import_edge_kind_type(RscId, proplists:get_value(<<"kind">>, Thing), proplists:get_value(<<"type">>, Thing), Context),
+                    import_edge_kind_type(RscId, proplists:get_value(<<"kind">>, Thing), proplists:get_value(<<"type">>, Thing), Context),
                     
                     % Import all edges
                     Stats2 = import_edges(Host, RscId, proplists:get_value(<<"edge">>, Thing), Stats1, Context),
-
                     Stats3 = import_keywords(RscId, proplists:get_value(<<"keyword">>, Thing), Stats2, Context),
-
-					case proplists:get_value(<<"file">>, Thing) of
+                    case proplists:get_value(<<"file">>, Thing) of
                         undefined ->
                             Stats3;
                         {struct, File} -> 
-							case proplists:get_value(<<"file_blob">>, File) of
-								undefined ->
-									% NEEDS FIX: import crashes on youtube attachment 
-									?DEBUG({"file url (not blob) ", RscId,  File}),
-									Stats3;
-								{struct, Fileblob} -> 
-									Filename = proplists:get_value(<<"original_file">>, File),
-									{struct, Fileblob} = proplists:get_value(<<"file_blob">>, File),
-									case proplists:get_value(<<"encode">>, Fileblob) of
-										<<"base64">> ->
-											Data = base64:decode(proplists:get_value(<<"data">>, Fileblob)),
-											write_file(AnymetaId, RscId, Filename, Data, Stats3, Context);
-										Encoding ->
-											Stats3#stats{error=[{AnymetaId, {unknown_file_encoding, Encoding}} | Stats3#stats.error]}
-								   end
-							end
+                            Filename = proplists:get_value(<<"original_file">>, File),
+                            {struct, Fileblob} = proplists:get_value(<<"file_blob">>, File),
+                            case proplists:get_value(<<"encode">>, Fileblob) of
+                                <<"base64">> ->
+                                    Data = base64:decode(proplists:get_value(<<"data">>, Fileblob)),
+                                    write_file(AnymetaId, RscId, Filename, Data, Stats3, Context);
+                                Encoding ->
+                                    Stats3#stats{error=[{AnymetaId, {unknown_file_encoding, Encoding}} | Stats3#stats.error]}
+                           end
                     end;
                 {error, Stats1} ->
                     Stats1
@@ -500,22 +479,16 @@ import_thing(Host, AnymetaId, Thing, KeepId, Stats, Context) ->
             undefined ->
                 true;
             _ ->
-                case is_empty(proplists:get_value(<<"lang">>, Thing)) of
-                    true ->
-                        true;
-                        _ ->
-                        case proplists:get_value(<<"uri">>, Thing) of
-                            <<"javascript:any_action", _/binary>> -> true;
-                            <<"../admin.php", _/binary>> -> true;
-                            _ ->
-                                % TODO: add a callback for skippable kinds
-                                case proplists:get_value(<<"kind">>, Thing) of
-                                    <<"UNKNOWN">> -> true;
-                                    <<"ROLE">> -> true;
-                                    <<"TYPE">> -> false;
-                                    <<"LANGUAGE">> -> true;
-                                    _ -> false
-                                end
+                case proplists:get_value(<<"uri">>, Thing) of
+                    <<"javascript:any_action", _/binary>> -> true;
+                    <<"../admin.php", _/binary>> -> true;
+                    _ ->
+                        % TODO: add a callback for skippable kinds
+                        case proplists:get_value(<<"kind">>, Thing) of
+                            <<"ROLE">> -> true;
+                            <<"TYPE">> -> false;
+                            <<"LANGUAGE">> -> true;
+                            _ -> false
                         end
                 end
         end.
@@ -681,6 +654,7 @@ map_fields([{<<"coverage">>, {struct, Cs}}|T], Acc) ->
     Acc1 = lists:foldl(
         fun({<<"date_start">>, D}, A) -> [ {date_start, convert_datetime(D)} | A ];
            ({<<"date_end">>, D}, A) -> [ {date_end, convert_datetime(D)} | A ];
+           ({<<"org_pubdate">>, D}, A) -> [ {org_pubdate, convert_datetime(D)} | A ];
            (_, A) -> A
         end,
         Acc,
@@ -814,6 +788,7 @@ fix_html_summary(Props) ->
     is_non_p_html(_) -> false.
 
 map_kind_type(<<"ROLE">>, _) -> predicate;
+map_kind_type(<<"TYPE">>, _) -> anymeta_type;
 map_kind_type(<<"ATTACHMENT">>, _) -> media;
 map_kind_type(<<"ARTICLE">>, _) -> article;
 map_kind_type(<<"ARTEFACT">>, _) -> artifact;
@@ -821,7 +796,6 @@ map_kind_type(<<"LISTPUBLISH">>, _) -> 'query';
 map_kind_type(<<"LISTEDIT">>, _) -> 'query';
 map_kind_type(<<"LANGUAGE">>, _) -> language;
 map_kind_type(<<"INSTITUTION">>, _) -> organization;
-map_kind_type(<<"LOCATION">>, _) -> location;
 map_kind_type(<<"SET">>, _) -> collection;
 map_kind_type(<<"KEYWORD">>, _) -> keyword;
 map_kind_type(<<"TAG">>, _) -> keyword;
@@ -833,10 +807,7 @@ map_predicate(<<"SETMEMBER">>) -> haspart;
 map_predicate(<<"FIGURE">>) -> depiction;
 map_predicate(<<"DOCUMENT">>) -> hasdocument;
 map_predicate(<<"ICON">>) -> hasicon;
-map_predicate(<<"HAS_TYPE">>) -> hastype;
 map_predicate(<<"RELATED">>) -> relation;
-map_predicate(<<"AUTHOR">>) -> author;
-map_predicate(<<"ABOUT">>) -> about;
 map_predicate(<<"ERR404">>) -> relation;
 map_predicate(<<"HOME_SET">>) -> hascollection;
 map_predicate(<<>>) -> relation;
@@ -847,26 +818,22 @@ map_language(<<"jp">>) -> <<"ja">>;
 map_language(Code) -> Code.
 
 
-write_rsc(AnymetaId, Uuid, Fields, KeepId, Stats, Context) ->
+write_rsc(AnymetaId, Fields, KeepId, Stats, Context) ->
+    Uuid = proplists:get_value(anymeta_uuid, Fields),
     ensure_category(proplists:get_value(category, Fields), Context),
     case check_previous_import(Uuid, Context) of
         {ok, RscId} ->
             Fields1 = proplists:delete(name, Fields),
             progress(io_lib:format("~w: updating (zotonic id: ~w)", [AnymetaId, RscId]), Context),
             {ok, RscId} = m_rsc_update:update(RscId, Fields1, [{escape_texts, false}, is_import], Context),
-            progress(io_lib:format("update", []), Context),
             register_import_anymeta_id(KeepId, AnymetaId, Uuid, Context),
             {ok, RscId, Stats};
         none -> 
-			Name = proplists:get_value(name, Fields),
+            Name = proplists:get_value(name, Fields),
             case check_existing_rsc(Fields, Context) of
                 {ok, RscId} ->
                     progress(io_lib:format("~w: exists, updating (name: ~p, zotonic id: ~w)", [AnymetaId, Name, RscId]), Context),
                     {ok, RscId} = m_rsc_update:update(RscId, Fields, [{escape_texts, false}, is_import], Context);
-                numeric ->
-                    Fields1 = proplists:delete(name, Fields),
-                    progress(io_lib:format("~w: Inserted", [AnymetaId]), Context),
-                    {ok, RscId} = m_rsc_update:insert(Fields1, [{escape_texts, false}, is_import], Context);
                 clash ->
                     Name = proplists:get_value(name, Fields),
                     Fields1 = proplists:delete(name, Fields),
@@ -951,22 +918,18 @@ write_rsc(AnymetaId, Uuid, Fields, KeepId, Stats, Context) ->
         case proplists:get_value(name, Fields) of
             undefined ->
                 none;
-            Name ->            
-                case z_utils:only_digits(Name) of
-                    true  -> numeric;
-                    false -> 
-                        case m_rsc:name_to_id(Name, Context) of
-                            {ok, RscId} ->
-                                Category = z_convert:to_binary(proplists:get_value(category, Fields)),
-                                case z_convert:to_binary(proplists:get_value(name, m_rsc:p(RscId, category, Context))) of
-                                    Category ->
-                                        {ok, RscId};
-                                    _Other ->
-                                        clash
-                                end;
-                            _ ->
-                                none
-                        end
+            Name ->
+                case m_rsc:name_to_id(Name, Context) of
+                    {ok, RscId} ->
+                        Category = z_convert:to_binary(proplists:get_value(category, Fields)),
+                        case z_convert:to_binary(proplists:get_value(name, m_rsc:p(RscId, category, Context))) of
+                            Category ->
+                                {ok, RscId};
+                            _Other ->
+                                clash
+                        end;
+                    _ ->
+                        none
                 end
         end.
 
@@ -991,7 +954,6 @@ write_rsc(AnymetaId, Uuid, Fields, KeepId, Stats, Context) ->
 
 
 % TODO: check if the file is changed, only import when it is changed.
-% FIX: files bigger then 10 MB crash the import
 write_file(AnymetaId, RscId, Filename, Data, Stats, Context) ->
     case is_file_changed(RscId, Data, Context) of
         true ->
@@ -1092,15 +1054,14 @@ import_keywords(RscId, KeywordIds, Stats, Context) when is_list(KeywordIds) ->
                 KeywordIds).
     
     import_keyword(SubjectId, KeywordId, Stats, Context) ->
-		% ?DEBUG({"import keyword", SubjectId, KeywordId, find_any_id(KeywordId, Context)}),
         case find_any_id(KeywordId, Context) of
-            {ok, RscId} ->
-                progress(io_lib:format("    Edge ~w -[~p]-> ~w", [SubjectId,'keyword',RscId]), Context),
-                {ok, _} = m_edge:insert(SubjectId, 'subject', RscId, [no_touch], Context),
+            {ok, ZotonicId} ->
+                progress(io_lib:format("    Edge ~w -[~p]-> ~w", [SubjectId,subject,ZotonicId]), Context),
+                {ok, _} = m_edge:insert(SubjectId, subject, ZotonicId, [no_touch], Context),
                 Stats;
             undefined ->
                 progress(io_lib:format("    Keyword ~w (not yet imported, delayed)", [KeywordId]), Context),
-                Stats#stats{delayed=[{'keyword', SubjectId, KeywordId}|Stats#stats.delayed]}
+                Stats#stats{delayed=[{keyword, SubjectId, KeywordId}|Stats#stats.delayed]}
         end.
     
 
@@ -1130,7 +1091,7 @@ convert_query(Fields, Thing, Context) ->
 
                     % Map to: http://zotonic.com/documentation/761/the-query-search-model
 
-                    % ?DEBUG({Kinds, Types, Exclude, HasObject, HasSubject, Sort, Limit}),
+                    ?DEBUG({Kinds, Types, Exclude, HasObject, HasSubject, Sort, Limit}),
                     Kind = case Kinds of 
                                [K] -> K;
                                _ -> undefined
